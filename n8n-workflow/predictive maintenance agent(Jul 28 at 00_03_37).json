@@ -1,0 +1,498 @@
+{
+  "updatedAt": "2026-07-27T22:03:37.700Z",
+  "createdAt": "2026-07-15T16:09:55.390Z",
+  "id": "6AVmCiGovrOEvHVT",
+  "name": "predictive maintenance agent",
+  "description": null,
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "60af1bd6-c0c1-4a84-bc3a-84c53b265f71",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "url": "http://host.docker.internal:8080/api/readings",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        208,
+        0
+      ],
+      "id": "82cd62d0-81fb-48b6-83ee-c17a63e1a60e",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const asset = $input.item.json;\n\n// Derived features — computed once per asset since we only have a single snapshot, not history\nconst tempDeviation = Math.round((asset.engineTempC - 80) * 100) / 100; // 80°C = normal baseline\nconst isOverdueMaintenance = asset.daysSinceMaintenance > 90;\nconst faultSeverity = asset.faultCodes >= 4 ? 'severe' : asset.faultCodes >= 2 ? 'moderate' : 'none';\nconst isLowFuel = asset.fuelLevelPct < 15;\n\nreturn {\n  json: {\n    ...asset,\n    temp_deviation_c: tempDeviation,\n    is_overdue_maintenance: isOverdueMaintenance,\n    fault_severity: faultSeverity,\n    is_low_fuel: isLowFuel\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        0
+      ],
+      "id": "b4541d45-ddc9-4875-9f13-955349ad74ff",
+      "name": "Preprocess Features"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const a = $input.item.json;\n\nlet score = 0;\nconst reasons = [];\n\n// Tool Wear Failure\nif (a.toolWearMin >= 200) {\n  score += 2;\n  reasons.push(`Tool wear at ${a.toolWearMin} min — approaching failure zone`);\n}\n\n// Heat Dissipation Failure\nconst tempDiff = a.processTempK - a.airTempK;\nif (tempDiff < 8.6 && a.rotationalSpeedRpm < 1380) {\n  score += 3;\n  reasons.push(`Low temp differential (${tempDiff.toFixed(1)}K) with low speed (${a.rotationalSpeedRpm} rpm) — poor heat dissipation`);\n}\n\n// Power Failure\nconst powerWatts = a.torqueNm * (a.rotationalSpeedRpm * 2 * Math.PI / 60);\nif (powerWatts < 3500 || powerWatts > 9000) {\n  score += 3;\n  reasons.push(`Power at ${powerWatts.toFixed(0)}W — outside safe operating range`);\n}\n\n// Overstrain Failure — threshold depends on product type\nconst osfThresholds = { L: 11000, M: 12000, H: 13000 };\nconst osfThreshold = osfThresholds[a.productType] || 12000;\nconst strainValue = a.toolWearMin * a.torqueNm;\nif (strainValue > osfThreshold) {\n  score += 3;\n  reasons.push(`Overstrain value ${strainValue.toFixed(0)} exceeds ${a.productType}-type threshold (${osfThreshold})`);\n}\n\nlet risk_level;\nif (score >= 6) risk_level = 'high';\nelse if (score >= 3) risk_level = 'medium';\nelse risk_level = 'low';\n\nreturn {\n  json: {\n    ...a,\n    power_watts: Math.round(powerWatts),\n    overstrain_value: Math.round(strainValue),\n    risk_score: score,\n    risk_level,\n    risk_reasons: reasons\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        832,
+        0
+      ],
+      "id": "a60a0112-0814-4c17-ac79-ce846240d8f3",
+      "name": "Rule-based Risk Score"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "0c1778af-ea3d-44ae-90a3-9b387a7356fa",
+              "leftValue": "={{ $json.risk_level }}",
+              "rightValue": "low",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1040,
+        0
+      ],
+      "id": "e9da5426-a252-43c5-8519-dbfe42b8ffa9",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const raw = $input.item.json;\n\nlet rawText;\ntry {\n  rawText = raw.content[0].text;\n} catch (e) {\n  // Path doesn't exist — return the raw structure so we can see what it actually looks like\n  return { json: { debug_error: \"content[0].text path failed\", raw_structure: raw } };\n}\n\n// Strip markdown code fences if present (```json ... ``` or ``` ... ```)\nconst cleaned = rawText.replace(/```json\\s*/g, '').replace(/```\\s*/g, '').trim();\n\nlet parsed;\ntry {\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  parsed = {\n    udi: null,\n    product_id: \"unknown\",\n    product_type: \"unknown\",\n    risk_level: \"unknown\",\n    risk_score: null,\n    explanation: \"Could not parse LLM response\",\n    recommended_action: \"Review manually\",\n    urgency: \"Unknown\",\n    debug_raw_text: rawText // temporary — so we can see exactly what Claude returned\n  };\n}\n\nreturn { json: parsed };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        -64
+      ],
+      "id": "09fda72e-af6f-4c43-8c2d-038cfd4b5207",
+      "name": "Parse LLM Output"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "bb180fae-da09-43ae-a616-1bbacbcb8090",
+              "leftValue": "={{ $json.risk_level }}",
+              "rightValue": "high",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1824,
+        -64
+      ],
+      "id": "8f577b0b-5e41-4944-85dc-9f1b8c961196",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "sendTo": "venkypatel300@gmail.com",
+        "subject": "=🚨 High-Risk Failure Alert: {{ $json.product_id }} (UDI {{ $json.udi }})",
+        "message": "=<h2 style=\"color:#c0392b;\">High-Risk Equipment Failure Alert</h2>\n\n<table style=\"border-collapse: collapse; width: 100%; max-width: 500px;\">\n  <tr>\n    <td style=\"padding:6px; font-weight:bold;\">Machine ID</td>\n    <td style=\"padding:6px;\">{{ $json.product_id }}</td>\n  </tr>\n  <tr>\n    <td style=\"padding:6px; font-weight:bold;\">UDI</td>\n    <td style=\"padding:6px;\">{{ $json.udi }}</td>\n  </tr>\n  <tr>\n    <td style=\"padding:6px; font-weight:bold;\">Product Type</td>\n    <td style=\"padding:6px;\">{{ $json.product_type }}</td>\n  </tr>\n  <tr>\n    <td style=\"padding:6px; font-weight:bold;\">Risk Level</td>\n    <td style=\"padding:6px;\">{{ $json.risk_level }} (score: {{ $json.risk_score }})</td>\n  </tr>\n  <tr>\n    <td style=\"padding:6px; font-weight:bold;\">Urgency</td>\n    <td style=\"padding:6px;\">{{ $json.urgency }}</td>\n  </tr>\n</table>\n\n<h3>Explanation</h3>\n<p>{{ $json.explanation }}</p>\n\n<h3>Recommended Action</h3>\n<p>{{ $json.recommended_action }}</p>\n\n<hr>\n<p style=\"font-size:12px; color:#888;\">Automated alert from Predictive Maintenance Agent — generated {{ $now.toFormat('yyyy-MM-dd HH:mm') }}</p>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2032,
+        -160
+      ],
+      "id": "188c6a5e-ba95-401f-9ff3-1b2e2e3b60e3",
+      "name": "Send a message",
+      "webhookId": "0cea9986-5f4f-4f2d-b4b3-3b8c2038d06e",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "Zy2rLekgoMMIpGJu",
+          "name": "Gmail account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1y2qwsFGTV-3q3la8CQ7RzB8T20M-x9EqsIhVr-g3wqo/edit?gid=0#gid=0",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1308296081,
+          "mode": "list",
+          "cachedResultName": "Sheet2",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1y2qwsFGTV-3q3la8CQ7RzB8T20M-x9EqsIhVr-g3wqo/edit#gid=1308296081"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $now.toISO() }}",
+            "udi": "={{ $json.udi }}",
+            "product_id": "={{ $json.product_id }}",
+            "product_type": "={{ $json.product_type }}",
+            "risk_level": "={{ $json.risk_level }}",
+            "risk_score": "={{ $json.risk_score }}",
+            "explanation": "={{ $json.explanation }}",
+            "recommended_action": "=\t{{ $json.recommended_action }}",
+            "urgency": "={{ $json.urgency }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "udi",
+              "displayName": "udi",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "product_id",
+              "displayName": "product_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "product_type",
+              "displayName": "product_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "risk_level",
+              "displayName": "risk_level",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "risk_score",
+              "displayName": "risk_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "explanation",
+              "displayName": "explanation",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "recommended_action",
+              "displayName": "recommended_action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "urgency",
+              "displayName": "urgency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2032,
+        32
+      ],
+      "id": "3489d495-d49b-409f-b479-3cdf7fe353f7",
+      "name": "Append row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "L2gJidxhotDmGgoh",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "claude-haiku-4-5-20251001",
+          "mode": "list",
+          "cachedResultName": "claude-haiku-4-5-20251001"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=Machine: {{ $json.productId }} (UDI {{ $json.udi }}, Type {{ $json.productType }})\nRisk level: {{ $json.risk_level }} (score: {{ $json.risk_score }})\nReasons flagged: {{ $json.risk_reasons.join(', ') }}\nAir temperature: {{ $json.airTempK }} K\nProcess temperature: {{ $json.processTempK }} K\nRotational speed: {{ $json.rotationalSpeedRpm }} rpm\nTorque: {{ $json.torqueNm }} Nm\nTool wear: {{ $json.toolWearMin }} min\nComputed power: {{ $json.power_watts }} W\nComputed overstrain value: {{ $json.overstrain_value }}"
+            }
+          ]
+        },
+        "options": {
+          "system": "You are a maintenance analyst reviewing confirmed equipment failure records from an industrial sensor dataset. Given structured risk data for one machine, explain the failure risk in 2-3 plain-language sentences a non-technical operations manager could understand, and recommend one clear action. Respond only in valid JSON with these exact keys: udi, product_id, product_type, risk_level, risk_score, explanation, recommended_action, urgency. Copy udi, product_id, product_type, risk_level, and risk_score exactly as given in the input — do not alter or recalculate them. Do not include any text outside the JSON object."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [
+        1232,
+        -176
+      ],
+      "id": "8562ddc8-9ca9-43cb-9101-b4bf387cd41b",
+      "name": "Message a model1",
+      "credentials": {
+        "anthropicApi": {
+          "id": "Dk7ZCsgr3gTI2wA8",
+          "name": "Anthropic account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Preprocess Features",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preprocess Features": {
+      "main": [
+        [
+          {
+            "node": "Rule-based Risk Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rule-based Risk Score": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Message a model1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM Output": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model1": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "pinData": {},
+  "versionId": "86b26440-ac77-492d-9add-0ea2f186641a",
+  "activeVersionId": null,
+  "versionCounter": 120,
+  "triggerCount": 0,
+  "sourceWorkflowId": null,
+  "shared": [
+    {
+      "updatedAt": "2026-07-15T16:09:55.393Z",
+      "createdAt": "2026-07-15T16:09:55.393Z",
+      "role": "workflow:owner",
+      "workflowId": "6AVmCiGovrOEvHVT",
+      "projectId": "TyHMKHWX25U4td4B",
+      "project": {
+        "updatedAt": "2026-06-27T15:13:05.004Z",
+        "createdAt": "2026-06-27T15:11:59.895Z",
+        "id": "TyHMKHWX25U4td4B",
+        "name": "Venky Patel Bonagiri <pvenky933@gmail.com>",
+        "type": "personal",
+        "icon": null,
+        "description": null,
+        "customTelemetryTags": [],
+        "creatorId": "1be6e91f-15d8-4dd5-9511-a187a3a6fa85"
+      }
+    }
+  ],
+  "tags": [],
+  "parentFolder": null,
+  "activeVersion": null,
+  "scopes": [
+    "execution:reveal",
+    "workflow:create",
+    "workflow:delete",
+    "workflow:disableRedaction",
+    "workflow:enableRedaction",
+    "workflow:execute",
+    "workflow:execute-chat",
+    "workflow:export",
+    "workflow:import",
+    "workflow:list",
+    "workflow:move",
+    "workflow:publish",
+    "workflow:read",
+    "workflow:share",
+    "workflow:unpublish",
+    "workflow:unshare",
+    "workflow:update"
+  ],
+  "checksum": "aba576854168fdf6b953af5dfb050a8398488fabf7bbdc981031c3c9179d09bf"
+}
